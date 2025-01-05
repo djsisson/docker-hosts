@@ -40,9 +40,9 @@ func main() {
 	updateHostsFile()
 
 	event, errs := cli.Events(ctx, events.ListOptions{
+		Since: "10s",
 		Filters: filters.NewArgs(
 			filters.Arg("type", "network"),
-			filters.Arg("since", "-10s"),
 		),
 	})
 	for {
