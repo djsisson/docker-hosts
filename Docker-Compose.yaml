@@ -1,7 +1,7 @@
 services:
   docker-hosts:
-    image: djsisson/docker-hosts:latest
+    image: ghcr.io/djsisson/docker-hosts:latest
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /etc/hosts:/tmp/hosts
+      - /etc/hosts:/tmp/hosts:rw

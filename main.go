@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -117,7 +118,9 @@ func updateHostsFile() {
 	lines := []string{}
 	BeginText := "### BEGIN DOCKER CONTAINERS ###"
 	EndText := "### END DOCKER CONTAINERS ###"
-	file, err := os.Open("/tmp/hosts")
+	dstPath := "/tmp/hosts"
+	tmpPath := "/tmp/hosts.tmp"
+	file, err := os.Open(dstPath)
 	if err != nil {
 		println("Error opening hosts file")
 		return
@@ -147,18 +150,26 @@ func updateHostsFile() {
 	}
 	lines = append(lines, EndText)
 	file.Close()
-	tmpfile, err := os.Create("/tmp/hosts.tmp")
+	tmpfile, err := os.Create(tmpPath)
+
 	if err != nil {
 		println("Error creating temp hosts file")
 		return
 	}
+
 	for _, line := range lines {
 		tmpfile.WriteString(line + "\n")
 	}
-	tmpfile.Close()
-	err = os.Rename("/tmp/hosts.tmp", "/tmp/hosts")
+	tmpfile.Seek(0, 0)
+	defer tmpfile.Close()
+	dst, err := os.Create(dstPath)
 	if err != nil {
-		println("Error renaming hosts file ", err)
+		println("Error creating hosts file")
+		return
+	}
+	defer dst.Close()
+	if _, err = io.Copy(dst, tmpfile); err != nil {
+		println("Error updating hosts file")
 		return
 	}
 }
