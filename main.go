@@ -12,14 +12,31 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 )
 
-var Containers = struct {
-	sync.RWMutex
-	Host map[string]map[string]string
-}{
-	Host: make(map[string]map[string]string)}
+var (
+	Containers = struct {
+		sync.RWMutex
+		Host map[string]map[string]string
+	}{
+		Host: make(map[string]map[string]string)}
+)
+
+type Hosts struct {
+	ContainerID string
+	Network     string
+	IP          string
+	Hosts       []string
+}
+
+type Network struct {
+	ContainerID string
+	Network     string
+	Name        string
+	HostName    string
+}
 
 func main() {
 	ctx := context.Background()
@@ -27,16 +44,37 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer cli.Close()
 	containers, _ := cli.ContainerList(ctx, container.ListOptions{})
-	var wait sync.WaitGroup
-	wait.Add(len(containers))
+	results := make(chan Hosts)
+	var wg sync.WaitGroup
 	for _, container := range containers {
-		go func(container types.Container) {
-			inspectContainer(cli, container.ID)
-			wait.Done()
-		}(container)
+		wg.Add(1)
+		go func(container types.Container, results chan Hosts) {
+			defer wg.Done()
+			c, err := cli.ContainerInspect(ctx, container.ID)
+			if err != nil {
+				return
+			}
+			inspectContainer(&c, results, "")
+		}(container, results)
 	}
-	wait.Wait()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	Containers.Lock()
+	for host := range results {
+		if host.ContainerID == "" {
+			delete(Containers.Host, host.ContainerID)
+			continue
+		}
+		if _, ok := Containers.Host[host.ContainerID]; !ok {
+			Containers.Host[host.ContainerID] = make(map[string]string)
+		}
+		Containers.Host[host.ContainerID][host.Network] = strings.Join(append([]string{host.IP}, host.Hosts...), " ")
+	}
+	Containers.Unlock()
 	updateHostsFile()
 
 	event, errs := cli.Events(ctx, events.ListOptions{
@@ -45,14 +83,14 @@ func main() {
 			filters.Arg("type", "network"),
 		),
 	})
+
 	for {
 		select {
 		case <-ctx.Done():
-			cli.Close()
 			return
 		case err := <-errs:
 			if err != nil {
-				cli.Close()
+				println(err)
 				return
 			}
 		case event := <-event:
@@ -60,7 +98,37 @@ func main() {
 				continue
 			}
 			if event.Action == "connect" {
-				inspectContainer(cli, event.Actor.Attributes["container"])
+
+				c, err := cli.ContainerInspect(ctx, event.Actor.Attributes["container"])
+				if err != nil {
+					delete(Containers.Host, event.Actor.Attributes["container"])
+					updateHostsFile()
+					continue
+				}
+				var wg sync.WaitGroup
+				wg.Add(1)
+				results := make(chan Hosts)
+				go func() {
+					defer wg.Done()
+					inspectContainer(&c, results, event.Actor.Attributes["name"])
+				}()
+				go func() {
+					wg.Wait()
+					close(results)
+				}()
+
+				Containers.Lock()
+				for host := range results {
+					if host.ContainerID == "" {
+						delete(Containers.Host, host.ContainerID)
+						continue
+					}
+					if _, ok := Containers.Host[host.ContainerID]; !ok {
+						Containers.Host[host.ContainerID] = make(map[string]string)
+					}
+					Containers.Host[host.ContainerID][host.Network] = strings.Join(append([]string{host.IP}, host.Hosts...), " ")
+				}
+				Containers.Unlock()
 				updateHostsFile()
 			} else if event.Action == "disconnect" {
 				Containers.Lock()
@@ -76,42 +144,68 @@ func main() {
 
 }
 
-func inspectContainer(cli *client.Client, containerID string) {
-	ctx := context.Background()
-	container, err := cli.ContainerInspect(ctx, containerID)
-	Containers.Lock()
-	defer Containers.Unlock()
-	delete(Containers.Host, containerID)
-	if err != nil {
+func hostsFromNetwork(n *network.EndpointSettings, h Network, c chan Hosts) {
+	if len(n.Aliases) == 0 || n.IPAddress == "" {
 		return
 	}
-	containerName := container.Name[1:]
-	containerHostName := container.Config.Hostname
-	containerIp := container.NetworkSettings.IPAddress
-	if container.Config.Domainname != "" {
-		containerHostName = containerHostName + "." + container.Config.Domainname
+	aliases := make(map[string]bool)
+	for _, alias := range n.Aliases {
+		aliases[alias] = true
 	}
-	Containers.Host[containerID] = make(map[string]string)
-	for name, network := range container.NetworkSettings.Networks {
-		if len(network.Aliases) == 0 || network.IPAddress == "" {
-			continue
-		}
-		aliases := make(map[string]bool)
-		for _, alias := range network.Aliases {
-			aliases[alias] = true
-		}
-		aliases[containerHostName] = true
-		aliases[containerName] = true
-		var aliasSlice []string
-		for alias := range aliases {
-			aliasSlice = append(aliasSlice, alias)
-		}
+	aliases[h.HostName] = true
+	aliases[h.Name] = true
+	var aliasSlice []string
+	for alias := range aliases {
+		aliasSlice = append(aliasSlice, alias)
+	}
+	c <- Hosts{
+		ContainerID: h.ContainerID,
+		Network:     h.Network,
+		IP:          n.IPAddress,
+		Hosts:       aliasSlice,
+	}
+}
 
-		Containers.Host[containerID][name] = strings.Join([]string{network.IPAddress, strings.Join(aliasSlice, " ")}, " ")
+func inspectContainer(c *types.ContainerJSON, h chan Hosts, n string) {
+
+	containerName := c.Name[1:]
+	containerID := c.ID
+	containerHostName := c.Config.Hostname
+	containerIp := c.NetworkSettings.IPAddress
+	if c.Config.Domainname != "" {
+		containerHostName = containerHostName + "." + c.Config.Domainname
 	}
 	if containerIp != "" {
-		Containers.Host[containerID]["bridge"] = strings.Join([]string{containerIp, containerHostName, containerName}, " ")
+		h <- Hosts{
+			ContainerID: containerID,
+			Network:     "bridge",
+			IP:          containerIp,
+			Hosts:       []string{containerHostName, containerName},
+		}
 	}
+	if n != "" {
+		hostsFromNetwork(c.NetworkSettings.Networks[n], Network{
+			ContainerID: containerID,
+			Network:     n,
+			Name:        containerName,
+			HostName:    containerHostName,
+		}, h)
+		return
+	}
+	wg := sync.WaitGroup{}
+	for name, network := range c.NetworkSettings.Networks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hostsFromNetwork(network, Network{
+				ContainerID: containerID,
+				Network:     name,
+				Name:        containerName,
+				HostName:    containerHostName,
+			}, h)
+		}()
+	}
+	wg.Wait()
 }
 
 func updateHostsFile() {
@@ -156,12 +250,12 @@ func updateHostsFile() {
 		println("Error creating temp hosts file")
 		return
 	}
-
+	defer tmpfile.Close()
 	for _, line := range lines {
 		tmpfile.WriteString(line + "\n")
 	}
 	tmpfile.Seek(0, 0)
-	defer tmpfile.Close()
+
 	dst, err := os.Create(dstPath)
 	if err != nil {
 		println("Error creating hosts file")
